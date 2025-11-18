@@ -209,30 +209,47 @@ def count_trainable_parameters(model: nn.Module):
     total = sum(p.numel() for p in model.parameters())
     return trainable, total
 
+def get_tokenized_data(data_file_path, tokenizer):
+    # --- Load data ---
+    with open(data_file_path, "r", encoding="utf-8") as f:
+        raw_samples = json.load(f)
+    if not isinstance(raw_samples, list) or not raw_samples or "input_text" not in raw_samples[0]:
+        raise ValueError("Dataset must be a non-empty list of {'input_text', 'target_text'} dicts.")
 
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    set_seed(42)
+    print("Example sample:", raw_samples[0])
 
-    # --- Paths (update to your checkpoints & dataset) ---
-    # Use a small, public student to demo; replace with your own
-    # student_ckpt = "./google/gemma-3-270m-it"           # run first time, after training, use saved path
+    processor = DataProcessor(tokenizer=tokenizer, max_length=256)
+    dataset_all = processor.prepare_data(raw_samples)
+    splits = processor.split_data(dataset_all, train_ratio=0.75, valid_ratio=0.125, seed=42)
 
-    student_ckpt = "./kd_v1_finetuned_model"
-    teacher1_ckpt = "./bigscience/bloomz-560m"
-    file_path = "./datasets/raw_samples_3000.json"     
-    save_model_path = "./kd_v1_finetuned_model"
+    tokenized_data = DatasetDict(
+        train=splits["train"].map(processor.tokenize_function, batched=True, remove_columns=splits["train"].column_names),
+        validation=splits["validation"].map(processor.tokenize_function, batched=True, remove_columns=splits["validation"].column_names),
+        test=splits["test"].map(processor.tokenize_function, batched=True, remove_columns=splits["test"].column_names),
+    )
+    return tokenized_data
 
-    # --- Quantization (optional but common) ---
-    use_bnb = True
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=False,
-    ) if use_bnb else None
+def get_teacher_model(teacher1_ckpt):
+    # --- Teacher model (frozen) ---
+    teacher1 = AutoModelForCausalLM.from_pretrained(
+        teacher1_ckpt,
+        # quantization_config=bnb_config,
+        device_map={"": 0},
+    )
+    teacher1.config.use_cache = False
+    for p in teacher1.parameters():
+        p.requires_grad = False
+    teacher1.eval()
+    return teacher1
+
+def get_student_model(student_ckpt):
+    # --- Student model ---
+    student = AutoModelForCausalLM.from_pretrained(
+        student_ckpt,
+        # quantization_config=bnb_config,
+        device_map={"": 0},
+    )
+    student.config.use_cache = False
 
     # --- LoRA ---
     peft_config = LoraConfig(
@@ -244,89 +261,49 @@ def main():
         target_modules=None,  # let PEFT find common modules; customize if needed
     )
 
+    # Attach LoRA
+    student = get_peft_model(student, peft_config)
+    student.print_trainable_parameters()
+    trn, tot = count_trainable_parameters(student)
+    print(f"Trainable params: {trn:,} / {tot:,} ({100 * trn / tot:.4f}%)")
+    return student
+
+def get_tokenizer(student_ckpt):
     # --- Tokenizer ---
     tokenizer = AutoTokenizer.from_pretrained(student_ckpt, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+    return tokenizer
 
-    # --- Student model ---
-    student = AutoModelForCausalLM.from_pretrained(
-        student_ckpt,
-        quantization_config=bnb_config,
-        device_map={"": 0},
-    )
-    student.config.use_cache = False
+# -----------------------------
+# Main
+# -----------------------------
+def train_and_evaluate(training_args, tokenized_data, teacher1, student, tokenizer, save_model_path):
+    set_seed(42)
+
+    # --- Quantization (optional but common) ---
+    # use_bnb = None
+    # bnb_config = BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_quant_type="nf4",
+    #     bnb_4bit_compute_dtype=torch.bfloat16,
+    #     bnb_4bit_use_double_quant=False,
+    # ) if use_bnb else None
 
     # Prepare for k-bit training BEFORE adding LoRA
-    if use_bnb:
-        student = prepare_model_for_kbit_training(student, use_gradient_checkpointing=True)
-        # For some archs, enabling input requires grad helps with PEFT on k-bit
-        student.enable_input_require_grads()
-
-    # Attach LoRA
-    student = get_peft_model(student, peft_config)
-    student.print_trainable_parameters()
-    trn, tot = count_trainable_parameters(student)
-    print(f"Trainable params: {trn:,} / {tot:,} ({100*trn/tot:.4f}%)")
-
-    # --- Teacher model (frozen) ---
-    teacher1 = AutoModelForCausalLM.from_pretrained(
-        teacher1_ckpt,
-        quantization_config=bnb_config,
-        device_map={"": 0},
-    )
-    teacher1.config.use_cache = False
-    for p in teacher1.parameters():
-        p.requires_grad = False
-    teacher1.eval()
-
-    # --- Load data ---
-    with open(file_path, "r", encoding="utf-8") as f:
-        raw_samples = json.load(f)
-    if not isinstance(raw_samples, list) or not raw_samples or "input_text" not in raw_samples[0]:
-        raise ValueError("Dataset must be a non-empty list of {'input_text', 'target_text'} dicts.")
-
-    print("Example sample:", raw_samples[0])
-
-    processor = DataProcessor(tokenizer=tokenizer, max_length=256)
-    dataset_all = processor.prepare_data(raw_samples)
-    splits = processor.split_data(dataset_all, train_ratio=0.75, valid_ratio=0.125, seed=42)
-
-    tokenized = DatasetDict(
-        train=splits["train"].map(processor.tokenize_function, batched=True, remove_columns=splits["train"].column_names),
-        validation=splits["validation"].map(processor.tokenize_function, batched=True, remove_columns=splits["validation"].column_names),
-        test=splits["test"].map(processor.tokenize_function, batched=True, remove_columns=splits["test"].column_names),
-    )
+    # if use_bnb:
+    #     student = prepare_model_for_kbit_training(student, use_gradient_checkpointing=True)
+    #     # For some archs, enabling input requires grad helps with PEFT on k-bit
+    #     student.enable_input_require_grads()
 
     collator = DataCollatorForCausalLMWithLabels(tokenizer)
-
-    # --- Training args ---
-    training_args = TrainingArguments(
-        output_dir="./kd_fixed_outputs",
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=2,
-        learning_rate=5e-5,
-        num_train_epochs=5,              # tune as needed
-        logging_steps=10,
-        save_steps=200,
-        eval_steps=100,
-        max_grad_norm=1.0, 
-        save_total_limit=2,
-        fp16=True,
-        report_to=[],                    # no external logger by default
-        remove_unused_columns=False,     # keep custom fields
-        gradient_checkpointing=True,     # helps w/ memory; works with prepare_model_for_kbit_training
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-    )
 
     trainer = MultipleTeacherTrainer(
         model=student,
         args=training_args,
-        train_dataset=tokenized["train"],
-        eval_dataset=tokenized["validation"],
+        train_dataset=tokenized_data["train"],
+        eval_dataset=tokenized_data["validation"],
         data_collator=collator,
         tokenizer=tokenizer,
         teacher1_model=teacher1,
@@ -334,20 +311,58 @@ def main():
     )
 
     # Sanity: ensure there are supervised tokens in a sample batch
-    sample = collator([tokenized["train"][0]])
+    sample = collator([tokenized_data["train"][0]])
     assert (sample["labels"] != -100).any(), "Collator produced a batch with all -100 labels."
 
     # --- Train & evaluate ---
     train_out = trainer.train()
     print("Train output:", train_out)
 
-    metrics = trainer.evaluate(tokenized["test"])
+    metrics = trainer.evaluate(tokenized_data["test"])
     print("Test metrics:", metrics)
 
-    # # Optionally save adapter
+    # Lưu lại mô hình đã huấn luyện
     trainer.save_model(save_model_path)
     tokenizer.save_pretrained(save_model_path) 
 
 
 if __name__ == "__main__":
-    main()
+    # --- Training tham số ---
+    training_args = TrainingArguments(
+        output_dir="./kd_fixed_outputs",
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        gradient_accumulation_steps=4, # -> batch size sẽ là 2x4=8
+        learning_rate=1e-4,
+        num_train_epochs=10,  # tune as needed
+        logging_steps=10,
+        save_steps=200,
+        eval_steps=100,
+        max_grad_norm=1.0,
+        save_total_limit=2,
+        fp16=True,
+        report_to=[],  # no external logger by default
+        remove_unused_columns=False,  # keep custom fields
+        # gradient_checkpointing=True,     # helps w/ memory; works with prepare_model_for_kbit_training
+        lr_scheduler_type="linear",
+        warmup_ratio=0.1,
+    )
+
+    teacher1_ckpt = "./bigscience/bloomz-560m"
+    teacher1 = get_teacher_model(teacher1_ckpt)
+
+    student_ckpt = "./kd_v1_finetuned_model"
+    if os.path.exists(student_ckpt) and os.path.isdir(student_ckpt):
+        student_ckpt = student_ckpt
+    else:
+        student_ckpt = "./google/gemma-3-270m-it"
+    student = get_student_model(student_ckpt)
+
+    tokenizer = get_tokenizer(student_ckpt)
+
+    data_file_path = "./my_datasets/raw_samples_3000.json"
+    tokenized_data = get_tokenized_data(data_file_path, tokenizer)
+
+    save_model_path = "./kd_v1_finetuned_model"
+
+    train_and_evaluate(training_args, tokenized_data, teacher1, student, tokenizer, save_model_path)
